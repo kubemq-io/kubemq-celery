@@ -1,0 +1,93 @@
+# KEDA ScaledObject for Celery worker autoscaling based on KubeMQ queue depth
+#
+# KEDA (Kubernetes Event-Driven Autoscaler) scales the Celery worker
+# deployment based on the number of pending messages in the KubeMQ queue.
+# This is more efficient than CPU/memory-based HPA for task queue workloads.
+#
+# Prerequisites:
+#   1. KEDA installed in the cluster:
+#      helm repo add kedacore https://kedacore.github.io/charts
+#      helm install keda kedacore/keda --namespace keda --create-namespace
+#
+#   2. KubeMQ broker running (kubemq.default.svc:50000)
+#   3. Celery worker Deployment (see deployment.yaml)
+#
+# Usage:
+#   kubectl apply -f keda-scaler.yaml
+#
+# How it works:
+#   - KEDA polls the KubeMQ queue depth every 10 seconds
+#   - When queue depth exceeds queueLength threshold, KEDA scales up workers
+#   - When queue drains, KEDA scales down after cooldownPeriod
+#   - minReplicaCount ensures at least 1 worker is always running
+
+# --- Default queue scaler ---
+apiVersion: keda.sh/v1alpha1
+kind: ScaledObject
+metadata:
+  name: celery-worker-scaler
+  namespace: default
+  labels:
+    app: celery-worker
+    component: autoscaling
+spec:
+  scaleTargetRef:
+    name: celery-worker          # must match Deployment name
+  minReplicaCount: 1             # always keep at least 1 worker
+  maxReplicaCount: 20            # maximum workers
+  pollingInterval: 10            # check queue depth every 10 seconds
+  cooldownPeriod: 60             # wait 60s before scaling down
+  triggers:
+    - type: kubemq
+      metadata:
+        # KubeMQ broker address (cluster-internal)
+        address: "kubemq.default.svc:50000"
+        # Queue channel to monitor (Celery default queue)
+        channel: "celery"
+        # Scale threshold: add workers when queue depth > 10
+        queueLength: "10"
+---
+# --- High-priority queue scaler (optional) ---
+#
+# If you use priority routing with separate queues, create a ScaledObject
+# per queue with different thresholds.
+#
+# apiVersion: keda.sh/v1alpha1
+# kind: ScaledObject
+# metadata:
+#   name: celery-high-priority-scaler
+#   namespace: default
+# spec:
+#   scaleTargetRef:
+#     name: celery-worker-high     # separate Deployment for high-priority
+#   minReplicaCount: 2             # always keep 2 for high-priority
+#   maxReplicaCount: 50
+#   pollingInterval: 5             # check more frequently
+#   cooldownPeriod: 30             # scale down faster
+#   triggers:
+#     - type: kubemq
+#       metadata:
+#         address: "kubemq.default.svc:50000"
+#         channel: "high-priority"
+#         queueLength: "5"         # lower threshold for high-priority
+# ---
+# --- Low-priority queue scaler (optional) ---
+#
+# apiVersion: keda.sh/v1alpha1
+# kind: ScaledObject
+# metadata:
+#   name: celery-low-priority-scaler
+#   namespace: default
+# spec:
+#   scaleTargetRef:
+#     name: celery-worker-low
+#   minReplicaCount: 0             # scale to zero when idle
+#   maxReplicaCount: 10
+#   pollingInterval: 30            # check less frequently
+#   cooldownPeriod: 300            # wait 5 minutes before scaling down
+#   triggers:
+#     - type: kubemq
+#       metadata:
+#         address: "kubemq.default.svc:50000"
+#         channel: "low-priority"
+#         queueLength: "50"        # higher threshold for low-priority

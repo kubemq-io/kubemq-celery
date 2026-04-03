@@ -1,0 +1,170 @@
+# Celery Worker Deployment for KubeMQ
+#
+# Deploys Celery workers that connect to a KubeMQ broker in the same cluster.
+# Workers process tasks from the 'celery' queue by default.
+#
+# Prerequisites:
+#   - KubeMQ broker running in the cluster (kubemq.default.svc:50000)
+#   - Application Docker image built and available
+#
+# Usage:
+#   kubectl apply -f deployment.yaml
+#
+# Scale workers:
+#   kubectl scale deployment/celery-worker --replicas=5
+#
+# For autoscaling, see keda-scaler.yaml
+
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: celery-worker
+  namespace: default
+  labels:
+    app: celery-worker
+    component: worker
+spec:
+  replicas: 3
+  selector:
+    matchLabels:
+      app: celery-worker
+  strategy:
+    type: RollingUpdate
+    rollingUpdate:
+      maxSurge: 1
+      maxUnavailable: 0  # zero-downtime rolling updates
+  template:
+    metadata:
+      labels:
+        app: celery-worker
+        component: worker
+    spec:
+      terminationGracePeriodSeconds: 120  # allow tasks to complete
+      containers:
+        - name: worker
+          image: myapp:latest
+          command:
+            - celery
+            - -A
+            - myapp
+            - worker
+            - --loglevel=info
+            - --concurrency=4
+            - --without-heartbeat  # optional: reduce overhead
+          env:
+            - name: CELERY_BROKER_URL
+              value: "kubemq://kubemq.default.svc:50000"
+            - name: CELERY_RESULT_BACKEND
+              value: "kubemq://kubemq.default.svc:50000"
+            # Optional: KubeMQ auth token from a Secret
+            # - name: KUBEMQ_AUTH_TOKEN
+            #   valueFrom:
+            #     secretKeyRef:
+            #       name: kubemq-auth
+            #       key: token
+          resources:
+            requests:
+              cpu: 250m
+              memory: 256Mi
+            limits:
+              cpu: 1000m
+              memory: 512Mi
+          # Readiness: worker is ready when it can reach the broker
+          readinessProbe:
+            exec:
+              command:
+                - celery
+                - -A
+                - myapp
+                - inspect
+                - ping
+                - --timeout=5
+            initialDelaySeconds: 30
+            periodSeconds: 30
+            timeoutSeconds: 10
+            failureThreshold: 3
+          # Liveness: worker is alive when it can still reach the broker
+          livenessProbe:
+            exec:
+              command:
+                - celery
+                - -A
+                - myapp
+                - inspect
+                - ping
+                - --timeout=5
+            initialDelaySeconds: 60
+            periodSeconds: 60
+            timeoutSeconds: 10
+            failureThreshold: 3
+          # Graceful shutdown: send SIGTERM, worker finishes current tasks
+          lifecycle:
+            preStop:
+              exec:
+                command: ["celery", "-A", "myapp", "control", "shutdown"]
+---
+# Optional: Flower monitoring deployment
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: flower
+  namespace: default
+  labels:
+    app: flower
+    component: monitoring
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: flower
+  template:
+    metadata:
+      labels:
+        app: flower
+        component: monitoring
+    spec:
+      containers:
+        - name: flower
+          image: mher/flower:latest
+          command:
+            - celery
+            - -A
+            - myapp
+            - flower
+            - --port=5555
+            - --broker=kubemq://kubemq.default.svc:50000
+          env:
+            - name: CELERY_BROKER_URL
+              value: "kubemq://kubemq.default.svc:50000"
+          ports:
+            - containerPort: 5555
+              name: http
+          resources:
+            requests:
+              cpu: 100m
+              memory: 128Mi
+            limits:
+              cpu: 500m
+              memory: 256Mi
+          readinessProbe:
+            httpGet:
+              path: /healthcheck
+              port: 5555
+            initialDelaySeconds: 10
+            periodSeconds: 15
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: flower
+  namespace: default
+  labels:
+    app: flower
+spec:
+  selector:
+    app: flower
+  ports:
+    - name: http
+      port: 5555
+      targetPort: 5555
+  type: ClusterIP

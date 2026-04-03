@@ -1,0 +1,66 @@
+# Docker Compose quickstart for kubemq-celery
+#
+# Starts a KubeMQ broker and Celery worker for local development.
+#
+# Usage:
+#   docker compose up -d          # start all services
+#   docker compose logs -f worker # watch worker logs
+#   docker compose down           # stop all services
+#
+# KubeMQ Dashboard: http://localhost:9090
+# Flower (if enabled): http://localhost:5555
+
+services:
+  # KubeMQ broker
+  kubemq:
+    image: kubemq/kubemq:latest
+    ports:
+      - "50000:50000"  # gRPC
+      - "9090:9090"    # Dashboard
+    environment:
+      - KUBEMQ_LOG_LEVEL=info
+    healthcheck:
+      test: ["CMD", "wget", "--spider", "-q", "http://localhost:9090/health"]
+      interval: 10s
+      timeout: 5s
+      retries: 3
+      start_period: 10s
+
+  # Celery worker
+  worker:
+    build:
+      context: ../..
+      dockerfile: examples/kubernetes/Dockerfile
+    command: celery -A basic_task worker --loglevel=info --concurrency=2
+    environment:
+      - CELERY_BROKER_URL=kubemq://kubemq:50000
+      - CELERY_RESULT_BACKEND=kubemq://kubemq:50000
+    depends_on:
+      kubemq:
+        condition: service_healthy
+    restart: unless-stopped
+
+  # Flower monitoring (optional -- uncomment to enable)
+  # flower:
+  #   build:
+  #     context: ../..
+  #     dockerfile: examples/kubernetes/Dockerfile
+  #   command: celery -A basic_task flower --port=5555
+  #   environment:
+  #     - CELERY_BROKER_URL=kubemq://kubemq:50000
+  #   ports:
+  #     - "5555:5555"
+  #   depends_on:
+  #     kubemq:
+  #       condition: service_healthy
+
+# Example Dockerfile (examples/kubernetes/Dockerfile):
+#
+#   FROM python:3.12-slim
+#   WORKDIR /app
+#   COPY pyproject.toml .
+#   RUN pip install --no-cache-dir .
+#   COPY src/ src/
+#   COPY examples/ examples/
+#   ENV PYTHONPATH=/app/src:/app/examples
+#   CMD ["celery", "-A", "basic_task", "worker", "--loglevel=info"]
