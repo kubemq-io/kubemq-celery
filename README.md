@@ -1,0 +1,1 @@
+# kubemq-celery-transport
