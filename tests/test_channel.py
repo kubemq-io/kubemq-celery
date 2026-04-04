@@ -7,6 +7,7 @@ from queue import Empty
 from unittest.mock import MagicMock, patch
 
 import pytest
+from kubemq.core.exceptions import ErrorCode, KubeMQChannelError
 
 from kubemq_celery.transport import Channel
 
@@ -230,6 +231,7 @@ class TestChannelPurge:
 
         mock_queues_client.ack_all_queue_messages.assert_called_once_with(
             channel="celery",
+            wait_time_seconds=1,
         )
 
     def test_purge_returns_actual_count(self, mock_queues_client):
@@ -279,6 +281,26 @@ class TestChannelSize:
         channel = _make_channel(queues_client=mock_queues_client)
 
         assert channel._size("celery") == 7
+
+    def test_size_peek_fallback_when_waiting_reports_zero(self, mock_queues_client):
+        """Broker may report waiting=0 while messages are visible — use peek count."""
+        mock_ch = MagicMock()
+        mock_ch.name = "celery"
+        mock_ch.incoming.waiting = 0
+        mock_queues_client.list_queues_channels.return_value = [mock_ch]
+
+        mock_peek = MagicMock()
+        mock_peek.is_error = False
+        mock_peek.messages = [MagicMock(), MagicMock(), MagicMock()]
+        mock_queues_client.peek_queue_messages.return_value = mock_peek
+
+        channel = _make_channel(queues_client=mock_queues_client)
+        assert channel._size("celery") == 3
+        mock_queues_client.peek_queue_messages.assert_called_once_with(
+            channel="celery",
+            max_messages=1024,
+            wait_timeout_in_seconds=1,
+        )
 
 
 # ===========================================================================
@@ -610,11 +632,11 @@ class TestChannelFanoutEvent:
 
         with (
             patch.object(channel, "_lookup", return_value=["queue1"]) as mock_lookup,
-            patch.object(channel, "_put") as mock_put,
+            patch.object(channel, "_send_fanout_queue_message") as mock_send,
         ):
             channel._on_fanout_event("celeryev", mock_event)
             mock_lookup.assert_called_once_with("celeryev", "")
-            mock_put.assert_called_once_with("queue1", message)
+            mock_send.assert_called_once_with("queue1", message)
 
     def test_on_fanout_event_handles_decode_error(self, mock_queues_client):
         """Verify _on_fanout_event() handles invalid JSON gracefully."""
@@ -626,11 +648,15 @@ class TestChannelFanoutEvent:
         channel._on_fanout_event("celeryev", mock_event)
 
     def test_on_fanout_error_logs_warning(self, mock_queues_client):
-        """Verify _on_fanout_error() does not raise."""
+        """Verify _on_fanout_error() does not raise and removes subscription."""
         channel = _make_channel(queues_client=mock_queues_client)
+        cancel = MagicMock()
+        channel._fanout_subscriptions["celeryev"] = cancel
 
-        # Should not raise
         channel._on_fanout_error("celeryev", RuntimeError("connection lost"))
+
+        assert "celeryev" not in channel._fanout_subscriptions
+        cancel.cancel.assert_called_once()
 
 
 # ===========================================================================
@@ -682,9 +708,12 @@ class TestChannelDelete:
             channel="celery",
         )
 
-    def test_delete_handles_error(self, mock_queues_client):
-        """Verify _delete() handles errors gracefully."""
-        mock_queues_client.delete_queues_channel.side_effect = RuntimeError("not found")
+    def test_delete_handles_not_found(self, mock_queues_client):
+        """Verify _delete() ignores NOT_FOUND only (spec §4.4.2a)."""
+        mock_queues_client.delete_queues_channel.side_effect = KubeMQChannelError(
+            "not found",
+            code=ErrorCode.NOT_FOUND,
+        )
         channel = _make_channel(queues_client=mock_queues_client)
 
         channel._delete("nonexistent")  # should not raise
@@ -730,12 +759,23 @@ class TestChannelHasQueue:
 
         assert channel._has_queue("celery") is False
 
-    def test_has_queue_returns_false_on_error(self, mock_queues_client):
-        """Verify _has_queue() returns False on exception."""
-        mock_queues_client.list_queues_channels.side_effect = RuntimeError("err")
+    def test_has_queue_returns_false_on_not_found(self, mock_queues_client):
+        """Verify _has_queue() returns False for NOT_FOUND (spec §4.4.2a)."""
+        mock_queues_client.list_queues_channels.side_effect = KubeMQChannelError(
+            "not found",
+            code=ErrorCode.NOT_FOUND,
+        )
         channel = _make_channel(queues_client=mock_queues_client)
 
         assert channel._has_queue("celery") is False
+
+    def test_has_queue_propagates_operational_error(self, mock_queues_client):
+        """Verify _has_queue() propagates non-NOT_FOUND errors."""
+        mock_queues_client.list_queues_channels.side_effect = RuntimeError("err")
+        channel = _make_channel(queues_client=mock_queues_client)
+
+        with pytest.raises(RuntimeError, match="err"):
+            channel._has_queue("celery")
 
     def test_has_queue_exact_match_only(self, mock_queues_client):
         """Verify _has_queue() uses exact name matching."""
@@ -756,12 +796,13 @@ class TestChannelHasQueue:
 class TestChannelSizeEdgeCases:
     """Additional edge case tests for Channel._size()."""
 
-    def test_size_returns_zero_on_exception(self, mock_queues_client):
-        """Verify _size() returns 0 on exception."""
+    def test_size_propagates_non_not_found(self, mock_queues_client):
+        """Verify _size() propagates operational errors (not NOT_FOUND)."""
         mock_queues_client.list_queues_channels.side_effect = RuntimeError("error")
         channel = _make_channel(queues_client=mock_queues_client)
 
-        assert channel._size("celery") == 0
+        with pytest.raises(RuntimeError, match="error"):
+            channel._size("celery")
 
     def test_size_returns_zero_when_no_match(self, mock_queues_client):
         """Verify _size() returns 0 when no channel matches exactly."""
@@ -769,6 +810,10 @@ class TestChannelSizeEdgeCases:
         mock_ch.name = "other-queue"
         mock_ch.incoming.waiting = 10
         mock_queues_client.list_queues_channels.return_value = [mock_ch]
+        mock_peek = MagicMock()
+        mock_peek.is_error = False
+        mock_peek.messages = []
+        mock_queues_client.peek_queue_messages.return_value = mock_peek
 
         channel = _make_channel(queues_client=mock_queues_client)
 

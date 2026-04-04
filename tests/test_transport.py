@@ -139,12 +139,12 @@ class TestTransport:
         assert result is False
 
     def test_verify_connection_no_channels(self):
-        """Verify verify_connection() returns True when no channels available."""
+        """Verify verify_connection() returns False when no channels (no broker check)."""
         transport = Transport.__new__(Transport)
         transport._avail_channels = set()
 
         result = transport.verify_connection(MagicMock())
-        assert result is True
+        assert result is False
 
     def test_establish_connection_success(self):
         """Verify establish_connection() creates and verifies a channel."""
@@ -165,10 +165,10 @@ class TestTransport:
         mock_channel.close.assert_called_once()
 
     def test_establish_connection_tls_from_url(self):
-        """Verify establish_connection() sets ssl=True when +tls in transport_cls."""
+        """Verify establish_connection() sets ssl=True when +tls in transport string."""
         transport = Transport.__new__(Transport)
         mock_conninfo = MagicMock()
-        mock_conninfo.transport_cls = "kubemq+tls"
+        mock_conninfo.transport = "kubemq+tls"
         transport.client = mock_conninfo
 
         mock_conn = MagicMock()

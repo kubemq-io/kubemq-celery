@@ -6,6 +6,7 @@ import json
 from datetime import timedelta
 from unittest.mock import MagicMock, patch
 
+import pytest
 from celery import Celery
 from kubemq.core.exceptions import KubeMQChannelError
 
@@ -49,6 +50,7 @@ class TestKubeMQResultBackend:
         # ack_all called first (purge old result)
         mock_queues_client.ack_all_queue_messages.assert_called_once_with(
             channel="celery-result-abc-123",
+            wait_time_seconds=1,
         )
 
         # send_queue_message called with correct channel and body
@@ -216,14 +218,13 @@ class TestKubeMQResultBackend:
         # send_queue_message should still be called
         mock_queues_client.send_queue_message.assert_called_once()
 
-    def test_get_task_meta_generic_exception_returns_pending(self, mock_queues_client):
-        """Verify _get_task_meta_for returns PENDING on generic exception."""
+    def test_get_task_meta_propagates_unexpected_peek_error(self, mock_queues_client):
+        """Verify _get_task_meta_for propagates non-KubeMQ peek failures (spec §5.3.2)."""
         mock_queues_client.peek_queue_messages.side_effect = RuntimeError("unexpected error")
         backend = _make_backend(mock_queues_client)
 
-        result = backend._get_task_meta_for("err-task-1")
-        assert result["status"] == "PENDING"
-        assert result["result"] is None
+        with pytest.raises(RuntimeError, match="unexpected error"):
+            backend._get_task_meta_for("err-task-1")
 
     def test_delete_group(self, mock_queues_client):
         """Verify _delete_group calls ack_all on the group channel."""
@@ -233,6 +234,7 @@ class TestKubeMQResultBackend:
 
         mock_queues_client.ack_all_queue_messages.assert_called_once_with(
             channel="celery-group-grp-del-1",
+            wait_time_seconds=1,
         )
 
     def test_delete_group_handles_error(self, mock_queues_client):

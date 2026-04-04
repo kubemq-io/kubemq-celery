@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+import pytest
+
 from kubemq_celery.utils import parse_broker_url, parse_result_url, sanitize_queue_name
 
 
@@ -35,8 +37,9 @@ class TestSanitizeQueueName:
     def test_already_valid_name(self):
         assert sanitize_queue_name("celery") == "celery"
 
-    def test_empty_string(self):
-        assert sanitize_queue_name("") == ""
+    def test_empty_string_raises(self):
+        with pytest.raises(ValueError, match="sanitizes to empty"):
+            sanitize_queue_name("")
 
 
 class TestParseBrokerUrl:
@@ -94,6 +97,11 @@ class TestParseResultUrl:
         result = parse_result_url("kubemq://localhost:50000/vhost")
         assert result["hostname"] == "localhost"
         assert result["port"] == 50000
+
+    def test_ipv6_url(self):
+        result = parse_result_url("kubemq://[::1]:50001")
+        assert result["hostname"] == "::1"
+        assert result["port"] == 50001
 
 
 class TestSanitizeQueueNameEdgeCases:

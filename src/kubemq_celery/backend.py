@@ -15,7 +15,8 @@ from kubemq.core.exceptions import KubeMQChannelError, KubeMQTimeoutError
 from kubemq.queues import QueueMessage
 from kubemq.queues.client import Client as QueuesClient
 
-from kubemq_celery.utils import parse_result_url
+from kubemq_celery.transport import DEFAULT_ACK_ALL_PURGE_WAIT_SECONDS
+from kubemq_celery.utils import format_grpc_address, parse_result_url, sanitize_queue_name
 
 logger = logging.getLogger("kubemq_celery.backend")
 
@@ -40,39 +41,60 @@ class KubeMQResultBackend(BaseBackend):
     MAX_EXPIRATION_SECONDS = 43200
 
     def __init__(self, app, url=None, **kwargs):
-        super().__init__(app, **kwargs)
+        super().__init__(app, url=url, **kwargs)
         self._url = url
+
+    def _backend_opts(self) -> dict:
+        return getattr(self.app.conf, "result_backend_transport_options", {}) or {}
 
     @cached_property
     def _queues_client(self) -> QueuesClient:
         """Lazy QueuesClient creation from result_backend URL."""
         url = self._url or self.app.conf.result_backend
-        # Parse connection info from result_backend URL via parse_result_url()
         url_params = parse_result_url(url or "")
         hostname = url_params["hostname"]
         port = url_params["port"]
         auth_token = url_params["auth_token"]
         tls_enabled = url_params["tls_enabled"]
+        opts = self._backend_opts()
 
-        # Celery normalizes the URL, but we also support transport_options
-        opts = getattr(self.app.conf, "result_backend_transport_options", {}) or {}
+        max_send = int(opts.get("max_send_size", 4_194_304))
+        max_recv = int(opts.get("max_receive_size", 4_194_304))
+        conn_timeout = opts.get("connection_timeout")
+        if conn_timeout is not None:
+            conn_timeout = float(conn_timeout)
 
-        config = ClientConfig(
-            address=f"{hostname}:{port}",
-            client_id=f"celery-result-{uuid4().hex[:8]}",
-            auth_token=auth_token or opts.get("auth_token"),
-            tls=TLSConfig(
+        cfg_kw: dict = {
+            "address": format_grpc_address(hostname, port),
+            "client_id": f"celery-result-{uuid4().hex[:8]}",
+            "auth_token": auth_token or opts.get("auth_token"),
+            "tls": TLSConfig(
                 enabled=tls_enabled or opts.get("tls_enabled", False),
                 cert_file=opts.get("tls_cert_file") or None,
                 key_file=opts.get("tls_key_file") or None,
                 ca_file=opts.get("tls_ca_file") or None,
             ),
-        )
+            "max_send_size": max_send,
+            "max_receive_size": max_recv,
+        }
+        if conn_timeout is not None:
+            cfg_kw["connection_timeout"] = conn_timeout
+        config = ClientConfig(**cfg_kw)
         return QueuesClient(config=config)
+
+    @cached_property
+    def _result_channel_prefix(self) -> str:
+        opts = self._backend_opts()
+        return str(opts.get("result_channel_prefix", self.RESULT_CHANNEL_PREFIX))
+
+    @cached_property
+    def _peek_timeout(self) -> int:
+        opts = self._backend_opts()
+        return int(opts.get("peek_timeout", 1))
 
     def _result_channel(self, task_id: str) -> str:
         """Generate result queue channel name for a task."""
-        return f"{self.RESULT_CHANNEL_PREFIX}{task_id}"
+        return f"{self._result_channel_prefix}{sanitize_queue_name(task_id)}"
 
     def _store_result(self, task_id, result, state, traceback=None, request=None, **kwargs):
         """Store task result as a KubeMQ Queue message.
@@ -111,7 +133,10 @@ class KubeMQResultBackend(BaseBackend):
 
         # Purge any previous result for this task (state transitions)
         try:
-            self._queues_client.ack_all_queue_messages(channel=channel)
+            self._queues_client.ack_all_queue_messages(
+                channel=channel,
+                wait_time_seconds=DEFAULT_ACK_ALL_PURGE_WAIT_SECONDS,
+            )
         except Exception:
             pass  # channel may not exist yet
 
@@ -135,25 +160,39 @@ class KubeMQResultBackend(BaseBackend):
         allowing multiple callers to read the same result.
         """
         channel = self._result_channel(task_id)
+        peek_timeout = self._peek_timeout
         try:
             result = self._queues_client.peek_queue_messages(
                 channel=channel,
                 max_messages=1,
-                wait_timeout_in_seconds=1,
+                wait_timeout_in_seconds=peek_timeout,
             )
+            if getattr(result, "is_error", False) is True:
+                logger.warning(
+                    "Peek error on %s: %s",
+                    channel,
+                    getattr(result, "error", ""),
+                )
+                raise KubeMQChannelError(getattr(result, "error", "") or "peek failed")
             if result.messages:
                 meta = json.loads(result.messages[0].body)
                 return self.meta_from_decoded(meta)
         except (KubeMQChannelError, KubeMQTimeoutError):
             pass  # channel doesn't exist or timeout -- task still pending
-        except Exception:
-            pass  # any other error -- return PENDING
+        except json.JSONDecodeError as exc:
+            logger.error(
+                "Corrupt result body for task %s on %s: %s",
+                task_id,
+                channel,
+                exc,
+            )
+            raise
 
         return {"status": "PENDING", "result": None}
 
     def _save_group(self, group_id, result):
         """Store group metadata as a queue message."""
-        channel = f"celery-group-{group_id}"
+        channel = f"celery-group-{sanitize_queue_name(group_id)}"
         body = json.dumps({"group_id": group_id, "result": result}).encode("utf-8")
 
         # Calculate expiration -- aligned with _store_result's pattern
@@ -182,13 +221,15 @@ class KubeMQResultBackend(BaseBackend):
 
     def _restore_group(self, group_id, cache=True):
         """Retrieve group metadata via peek."""
-        channel = f"celery-group-{group_id}"
+        channel = f"celery-group-{sanitize_queue_name(group_id)}"
         try:
             result = self._queues_client.peek_queue_messages(
                 channel=channel,
                 max_messages=1,
-                wait_timeout_in_seconds=1,
+                wait_timeout_in_seconds=self._peek_timeout,
             )
+            if getattr(result, "is_error", False) is True:
+                return None
             if result.messages:
                 return json.loads(result.messages[0].body)
         except Exception:
@@ -197,9 +238,12 @@ class KubeMQResultBackend(BaseBackend):
 
     def _delete_group(self, group_id):
         """Delete group metadata."""
-        channel = f"celery-group-{group_id}"
+        channel = f"celery-group-{sanitize_queue_name(group_id)}"
         try:
-            self._queues_client.ack_all_queue_messages(channel=channel)
+            self._queues_client.ack_all_queue_messages(
+                channel=channel,
+                wait_time_seconds=DEFAULT_ACK_ALL_PURGE_WAIT_SECONDS,
+            )
         except Exception:
             pass
 

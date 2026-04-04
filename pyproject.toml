@@ -52,6 +52,10 @@ select = ["E", "F", "W", "I", "UP"]
 [tool.pytest.ini_options]
 testpaths = ["tests"]
 addopts = "--strict-markers -v"
+markers = [
+    "integration: integration tests that require a live KubeMQ broker",
+    "e2e: Celery application tests that require a live KubeMQ broker",
+]
 
 [tool.coverage.run]
 source = ["kubemq_celery"]
