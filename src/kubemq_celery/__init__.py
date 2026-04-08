@@ -5,7 +5,7 @@ from __future__ import annotations
 from kubemq_celery.backend import KubeMQResultBackend
 from kubemq_celery.transport import Transport
 
-__version__ = "1.0.0"
+__version__ = "1.1.0"
 __all__ = ["Transport", "KubeMQResultBackend"]
 
 # Auto-register transport aliases

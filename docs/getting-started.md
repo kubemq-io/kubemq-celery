@@ -4,7 +4,7 @@ Get a Celery app running on KubeMQ in under 5 minutes.
 
 ## Prerequisites
 
-- **Python >= 3.11**
+- **Python >= 3.10**
 - **KubeMQ broker** running and accessible (default: `localhost:50000`)
   - Docker: `docker run -d -p 50000:50000 -p 9090:9090 kubemq/kubemq:latest`
   - Kubernetes: see [Kubernetes Deployment Guide](kubernetes.md)
@@ -124,4 +124,4 @@ See [examples/kubernetes/docker-compose.yaml](../examples/kubernetes/docker-comp
 - [Configuration Reference](configuration.md) -- all transport options, TLS, result backend settings
 - [Migration Guide](migration-guide.md) -- switching from Redis or RabbitMQ
 - [Kubernetes Deployment](kubernetes.md) -- production K8s deployment with KEDA autoscaling
-- [Examples](../examples/) -- priority routing, delayed tasks, FastAPI integration, and more
+- [Examples](../examples/README.md) -- 95+ examples across 14 categories (quickstart, connection, canvas, error handling, and more)

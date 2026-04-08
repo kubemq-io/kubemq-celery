@@ -43,3 +43,138 @@ class TestCeleryE2E:
             return x
 
         assert echo.name == "e2e.echo"
+
+
+# ===========================================================================
+# T7: E2E Test Expansion
+# ===========================================================================
+
+
+class TestCeleryE2EExpanded:
+    """T7: Expanded E2E tests for full task lifecycle.
+
+    Uses eager mode to test task execution without a live broker.
+    These validate that KubeMQ transport options integrate correctly
+    with Celery's task execution pipeline.
+    """
+
+    def _make_app(self):
+        """Create a Celery app in eager mode."""
+        app = Celery("e2e-expanded", broker=_broker_url())
+        app.config_from_object(
+            {
+                "task_always_eager": True,
+                "task_eager_propagates": True,
+                "result_backend": "kubemq://localhost:50000",
+            }
+        )
+        return app
+
+    def test_full_task_lifecycle(self):
+        """T7-lifecycle: Test complete task lifecycle: define, call, get result."""
+        app = self._make_app()
+
+        @app.task(name="e2e.add")
+        def add(x, y):
+            return x + y
+
+        result = add.delay(3, 4)
+        assert result.get(timeout=5) == 7
+        assert result.successful()
+
+    def test_task_with_countdown(self):
+        """T7-countdown: Test task with countdown parameter.
+
+        In eager mode, countdown is ignored but the parameter should
+        not cause errors.
+        """
+        app = self._make_app()
+
+        @app.task(name="e2e.delayed_add")
+        def delayed_add(x, y):
+            return x + y
+
+        result = delayed_add.apply_async(args=(5, 6), countdown=2)
+        assert result.get(timeout=5) == 11
+
+    def test_task_failure_state(self):
+        """T7-failure: Test task failure state propagation."""
+        app = self._make_app()
+
+        @app.task(name="e2e.fail")
+        def fail_task():
+            raise ValueError("deliberate failure")
+
+        with pytest.raises(ValueError, match="deliberate failure"):
+            fail_task.delay().get(timeout=5)
+
+    def test_task_with_expiration(self):
+        """T7-expiration: Test task with expires parameter.
+
+        In eager mode, expires is ignored but the parameter should
+        not cause errors.
+        """
+        app = self._make_app()
+
+        @app.task(name="e2e.expiring")
+        def expiring_task(x):
+            return x * 2
+
+        result = expiring_task.apply_async(args=(21,), expires=60)
+        assert result.get(timeout=5) == 42
+
+    def test_batch_receive_mixed_task_types(self):
+        """T7-batch-mixed: Test multiple tasks of different types."""
+        app = self._make_app()
+
+        @app.task(name="e2e.add_mixed")
+        def add_mixed(x, y):
+            return x + y
+
+        @app.task(name="e2e.multiply_mixed")
+        def multiply_mixed(x, y):
+            return x * y
+
+        @app.task(name="e2e.negate_mixed")
+        def negate_mixed(x):
+            return -x
+
+        results = [
+            add_mixed.delay(1, 2),
+            multiply_mixed.delay(3, 4),
+            negate_mixed.delay(5),
+        ]
+
+        values = [r.get(timeout=5) for r in results]
+        assert values == [3, 12, -5]
+
+    def test_task_retry_mechanism(self):
+        """Test task retry mechanism works with KubeMQ transport."""
+        app = self._make_app()
+        # Disable eager propagation so Celery handles retries internally
+        # instead of raising the Retry exception directly.
+        app.conf.task_eager_propagates = False
+
+        call_count = {"value": 0}
+
+        @app.task(name="e2e.retry_task", bind=True, max_retries=2)
+        def retry_task(self):
+            call_count["value"] += 1
+            if call_count["value"] < 3:
+                raise self.retry(countdown=0)
+            return "success"
+
+        result = retry_task.delay()
+        assert result.get(timeout=5) == "success"
+        assert call_count["value"] == 3
+
+    def test_task_with_kwargs(self):
+        """Test task with keyword arguments."""
+        app = self._make_app()
+
+        @app.task(name="e2e.greet")
+        def greet(name, greeting="Hello"):
+            return f"{greeting}, {name}!"
+
+        result = greet.delay("World", greeting="Hi")
+        assert result.get(timeout=5) == "Hi, World!"

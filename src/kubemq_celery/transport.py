@@ -2,10 +2,12 @@
 
 from __future__ import annotations
 
+import atexit
 import json
 import logging
 import threading
-from datetime import UTC, datetime
+import time
+from collections import deque
 from functools import cached_property
 from queue import Empty
 from typing import Any
@@ -16,7 +18,6 @@ from kubemq.common.cancellation_token import CancellationToken
 from kubemq.core import ClientConfig
 from kubemq.core.config import TLSConfig
 from kubemq.core.exceptions import (
-    ErrorCode,
     KubeMQAuthenticationError,
     KubeMQChannelError,
     KubeMQClientClosedError,
@@ -32,21 +33,18 @@ from kubemq.pubsub.client import Client as PubSubClient
 from kubemq.queues import QueueMessage
 from kubemq.queues.client import Client as QueuesClient
 
-from kubemq_celery.utils import format_grpc_address, sanitize_queue_name
+from kubemq_celery.base import DEFAULT_ACK_ALL_PURGE_WAIT_SECONDS, BaseKubeMQChannel
+from kubemq_celery.utils import format_grpc_address, is_not_found, sanitize_queue_name
 
 logger = logging.getLogger("kubemq_celery")
 
-# KubeMQ Python SDK defaults ack_all_queue_messages(wait_time_seconds=60). For purge
-# (empty queues), that blocks up to 60s per call — use a short wait for Kombu/Celery semantics.
-DEFAULT_ACK_ALL_PURGE_WAIT_SECONDS = 1
 
+class Channel(BaseKubeMQChannel, virtual.Channel):
+    """KubeMQ Channel -- implements storage primitives for Kombu virtual transport.
 
-def _is_not_found(exc: BaseException) -> bool:
-    return getattr(exc, "code", None) == ErrorCode.NOT_FOUND
-
-
-class Channel(virtual.Channel):
-    """KubeMQ Channel -- implements storage primitives for Kombu virtual transport."""
+    Inherits shared business logic from BaseKubeMQChannel (ABC) and
+    storage primitives from Kombu's virtual.Channel.
+    """
 
     supports_fanout = True
     do_restore = False  # KubeMQ handles redelivery natively
@@ -66,6 +64,12 @@ class Channel(virtual.Channel):
         "max_receive_size",
         "connection_timeout",
         "purge_wait_seconds",
+        "message_expiration",
+        "max_batch_size",
+        "fanout_max_retries",
+        "grpc_keepalive_time",
+        "grpc_keepalive_timeout",
+        "grpc_permit_without_calls",
     )
 
     wait_timeout: int = 1  # seconds -- blocking receive timeout
@@ -83,14 +87,34 @@ class Channel(virtual.Channel):
     # ack_all wait (SDK default 60s is too slow for empty-queue purge)
     purge_wait_seconds: int = DEFAULT_ACK_ALL_PURGE_WAIT_SECONDS
 
+    # v1.1 options
+    message_expiration: int = 0  # seconds; 0 = no expiration (C1)
+    max_batch_size: int = 10  # max messages per gRPC receive call (C6)
+    fanout_max_retries: int = 5  # max re-subscription attempts (C2)
+    grpc_keepalive_time: int = 30  # seconds between keepalive pings (C10)
+    grpc_keepalive_timeout: int = 10  # seconds to wait for response (C10)
+    grpc_permit_without_calls: bool = True  # keepalive without active RPCs (C10)
+
     def __init__(self, *args: Any, **kwargs: Any) -> None:
         super().__init__(*args, **kwargs)
+        # Validate DLQ configuration (M-2)
+        if self.max_receive_count > 0 and not self.dead_letter_queue:
+            from kubemq_celery.exceptions import KubeMQCeleryConfigError
+
+            raise KubeMQCeleryConfigError(
+                f"max_receive_count={self.max_receive_count} requires dead_letter_queue "
+                f"to be set. Without a DLQ, poison messages will be retried indefinitely."
+            )
         self._closed: bool = False
         self._fanout_subscriptions: dict[str, CancellationToken] = {}
         self._kubemq_msg_refs: dict[str, Any] = {}
         # Track which queues were registered with no_ack=True
         self._no_ack_queues: set[str] = set()
         self._no_ack_tags: set[str] = set()  # consumer_tags registered with no_ack=True
+        # Batch receive buffers (C6) -- per-queue deque of (payload, msg_ref) tuples
+        self._batch_buffers: dict[str, deque[tuple[dict, Any]]] = {}
+        self._batch_buffer_locks: dict[str, threading.Lock] = {}
+        atexit.register(self._drain_batch_buffers)
         # Lock for fanout subscription dict and fanout buffer writes.
         # subscribe_to_events() runs callbacks in a background thread,
         # so _subscribe_fanout() and _on_fanout_event() need explicit
@@ -118,13 +142,14 @@ class Channel(virtual.Channel):
 
     # --- Lazy client creation ---
 
-    @cached_property
-    def _kubemq_queues_client(self) -> QueuesClient:
-        """Lazy KubeMQ QueuesClient -- created on first use."""
+    def _build_client_config_kwargs(self, prefix: str = "queues") -> dict[str, Any]:
+        """Build ClientConfig kwargs (shared between queues and pubsub clients)."""
+        from kubemq.core.config import KeepAliveConfig
+
         conninfo = self.connection.client
         cfg_kw: dict[str, Any] = {
             "address": self._grpc_address(),
-            "client_id": f"{self.client_id_prefix}-queues-{uuid4().hex[:8]}",
+            "client_id": f"{self.client_id_prefix}-{prefix}-{uuid4().hex[:8]}",
             "auth_token": self.auth_token or conninfo.password or None,
             "tls": TLSConfig(
                 enabled=self.tls_enabled or bool(conninfo.ssl),
@@ -134,35 +159,35 @@ class Channel(virtual.Channel):
             ),
             "max_send_size": self.max_send_size,
             "max_receive_size": self.max_receive_size,
+            "keep_alive": KeepAliveConfig(
+                enabled=True,
+                ping_interval_in_seconds=self.grpc_keepalive_time,
+                ping_timeout_in_seconds=self.grpc_keepalive_timeout,
+                permit_without_calls=self.grpc_permit_without_calls,
+            ),
         }
         ct = self._connection_timeout_value()
         if ct is not None:
             cfg_kw["connection_timeout"] = ct
+        return cfg_kw
+
+    @cached_property
+    def _kubemq_queues_client(self) -> QueuesClient:
+        """Lazy KubeMQ QueuesClient -- created on first use."""
+        cfg_kw = self._build_client_config_kwargs(prefix="queues")
         config = ClientConfig(**cfg_kw)
-        return QueuesClient(config=config)
+        client = QueuesClient(config=config)
+        logger.info("KubeMQ QueuesClient created (client_id: %s)", cfg_kw["client_id"])
+        return client
 
     @cached_property
     def _kubemq_pubsub_client(self) -> PubSubClient:
         """Lazy KubeMQ PubSubClient -- created on first fanout use."""
-        conninfo = self.connection.client
-        cfg_kw: dict[str, Any] = {
-            "address": self._grpc_address(),
-            "client_id": f"{self.client_id_prefix}-pubsub-{uuid4().hex[:8]}",
-            "auth_token": self.auth_token or conninfo.password or None,
-            "tls": TLSConfig(
-                enabled=self.tls_enabled or bool(conninfo.ssl),
-                cert_file=self.tls_cert_file or None,
-                key_file=self.tls_key_file or None,
-                ca_file=self.tls_ca_file or None,
-            ),
-            "max_send_size": self.max_send_size,
-            "max_receive_size": self.max_receive_size,
-        }
-        ct = self._connection_timeout_value()
-        if ct is not None:
-            cfg_kw["connection_timeout"] = ct
+        cfg_kw = self._build_client_config_kwargs(prefix="pubsub")
         config = ClientConfig(**cfg_kw)
-        return PubSubClient(config=config)
+        client = PubSubClient(config=config)
+        logger.info("KubeMQ PubSubClient created (client_id: %s)", cfg_kw["client_id"])
+        return client
 
     # --- Helper methods ---
 
@@ -174,6 +199,10 @@ class Channel(virtual.Channel):
         task_acks_late=True (manual ack mode).
         """
         return queue in self._no_ack_queues
+
+    def _backoff_sleep(self, seconds: float) -> None:
+        """Sync backoff sleep using time.sleep()."""
+        time.sleep(seconds)
 
     def basic_consume(self, queue, no_ack, *args, **kwargs):
         """Override to track no_ack setting per queue."""
@@ -207,79 +236,48 @@ class Channel(virtual.Channel):
         if self._closed:
             raise KubeMQClientClosedError("channel closed")
 
-        body = json.dumps(message).encode("utf-8")
-
-        # Extract delay from Celery message headers
-        headers = message.get("headers", {}) or {}
-        properties = message.get("properties", {}) or {}
-        countdown = headers.get("countdown")
-        eta = headers.get("eta")
-
-        delay_seconds = 0
-        if countdown is not None:
-            try:
-                delay_seconds = int(countdown)
-            except (ValueError, TypeError):
-                delay_seconds = 0
-        elif eta:
-            try:
-                eta_dt = datetime.fromisoformat(eta)
-                if eta_dt.tzinfo is None:
-                    eta_dt = eta_dt.replace(tzinfo=UTC)
-                now = datetime.now(UTC)
-                delay_seconds = max(0, int((eta_dt - now).total_seconds()))
-            except (ValueError, TypeError):
-                delay_seconds = 0
-
-        # Cap at KubeMQ max (12 hours = 43200 seconds)
-        if delay_seconds > 43200:
-            logger.warning(
-                "Delay %ds exceeds KubeMQ max 43200s (12h), capping at 43200s",
-                delay_seconds,
-            )
-            delay_seconds = 43200
-
-        # Extract priority for tags
-        priority = str(properties.get("priority", 0))
-
-        # Extract headers as metadata for debugging visibility
-        metadata = json.dumps(headers) if headers else ""
-
-        # Build QueueMessage
-        msg_kwargs: dict[str, Any] = {
-            "channel": sanitize_queue_name(queue),
-            "body": body,
-            "metadata": metadata or None,
-            "tags": {"priority": priority},
-        }
-        if delay_seconds > 0:
-            msg_kwargs["delay_in_seconds"] = delay_seconds
-        if self.max_receive_count > 0 and self.dead_letter_queue:
-            msg_kwargs["max_receive_count"] = self.max_receive_count
-            msg_kwargs["max_receive_queue"] = sanitize_queue_name(self.dead_letter_queue)
-
+        msg_kwargs = self._build_queue_message_kwargs(queue, message)
         msg = QueueMessage(**msg_kwargs)
         self._kubemq_queues_client.send_queue_message(msg)
+        logger.debug("Message sent to queue '%s'", sanitize_queue_name(queue))
 
     def _get(self, queue: str, timeout: int | None = None) -> dict:
         """Receive a Celery message from a KubeMQ Queue channel.
 
-        Uses auto_ack=True when the consumer was registered with no_ack=True
-        (Celery default, task_acks_late=False). Uses auto_ack=False when
-        task_acks_late=True for manual ack mode. See spec section 6.3.
+        When batch mode is enabled (max_batch_size > 1), receives up to
+        max_batch_size messages in a single gRPC call. Returns the first
+        message immediately and buffers the rest for subsequent _get() calls.
         """
         if self._closed:
             raise KubeMQClientClosedError("channel closed")
 
+        sanitized = sanitize_queue_name(queue)
+
+        # Check buffer first
+        buffer_lock = self._batch_buffer_locks.setdefault(sanitized, threading.Lock())
+        with buffer_lock:
+            buffer = self._batch_buffers.get(sanitized)
+            if buffer:
+                payload, msg_ref = buffer.popleft()
+                # Store msg ref for ack (if not auto-ack)
+                auto_ack = self._is_auto_ack_queue(queue)
+                if not auto_ack:
+                    delivery_tag = payload.get("properties", {}).get("delivery_tag")
+                    if delivery_tag:
+                        self._kubemq_msg_refs[delivery_tag] = msg_ref
+                return payload
+
+        # Buffer empty -- fetch from broker
         auto_ack = self._is_auto_ack_queue(queue)
-        # KubeMQ SDK expects integer seconds for downstream wait (protobuf int32).
         wait_secs = max(0, int(self.wait_timeout))
         if timeout is not None:
             wait_secs = max(0, min(wait_secs, int(timeout)))
 
+        batch_size = max(1, min(int(self.max_batch_size), self.MAX_BATCH_SIZE))
+
         response = self._kubemq_queues_client.receive_queue_messages(
-            channel=sanitize_queue_name(queue),
-            max_messages=1,
+            channel=sanitized,
+            max_messages=batch_size,
             wait_timeout_in_seconds=wait_secs,
             auto_ack=auto_ack,
         )
@@ -291,46 +289,60 @@ class Channel(virtual.Channel):
         if not response.messages:
             raise Empty()
 
-        msg = response.messages[0]
-        try:
-            payload = json.loads(msg.body)
-        except json.JSONDecodeError as exc:
-            if not auto_ack:
-                try:
-                    msg.nack()
-                except Exception:
-                    logger.exception("nack after JSON decode failure")
-            logger.error(
-                "Invalid JSON body on queue %s: %s",
-                sanitize_queue_name(queue),
-                exc,
-            )
-            raise KubeMQChannelError("invalid JSON message body") from exc
+        # Process all messages
+        parsed_messages: list[tuple[dict, Any]] = []
+        for msg in response.messages:
+            try:
+                payload = self._deserialize_message(msg.body)
+            except json.JSONDecodeError as exc:
+                if not auto_ack:
+                    try:
+                        msg.nack()
+                    except Exception:
+                        logger.exception("nack after JSON decode failure")
+                logger.error("Invalid JSON body on queue %s: %s", sanitized, exc)
+                continue  # skip bad messages
 
-        if not isinstance(payload, dict):
-            if not auto_ack:
-                try:
-                    msg.nack()
-                except Exception:
-                    logger.exception("nack after non-dict JSON payload")
-            raise KubeMQChannelError("message body must be a JSON object")
+            if not isinstance(payload, dict):
+                if not auto_ack:
+                    try:
+                        msg.nack()
+                    except Exception:
+                        logger.exception("nack after non-dict JSON payload")
+                continue
 
-        # Store KubeMQ message reference for native ack (only if not auto-acked)
+            parsed_messages.append((payload, msg))
+
+        if not parsed_messages:
+            raise Empty()
+
+        # Return first, buffer rest
+        first_payload, first_msg = parsed_messages[0]
+
         if not auto_ack:
-            delivery_tag = payload.get("properties", {}).get("delivery_tag")
+            delivery_tag = first_payload.get("properties", {}).get("delivery_tag")
             if not delivery_tag:
                 try:
-                    msg.nack()
+                    first_msg.nack()
                 except Exception:
                     logger.exception("nack after missing delivery_tag")
-                logger.warning(
-                    "Missing delivery_tag in manual-ack mode on queue %s",
-                    sanitize_queue_name(queue),
-                )
                 raise KubeMQChannelError("missing delivery_tag in manual ack mode")
-            self._kubemq_msg_refs[delivery_tag] = msg
+            self._kubemq_msg_refs[delivery_tag] = first_msg
 
-        return payload
+        # Buffer remaining messages
+        if len(parsed_messages) > 1:
+            with buffer_lock:
+                buffer = self._batch_buffers.setdefault(sanitized, deque())
+                for payload, msg_ref in parsed_messages[1:]:
+                    if not auto_ack:
+                        # Store msg refs for buffered messages too
+                        dt = payload.get("properties", {}).get("delivery_tag")
+                        if dt:
+                            self._kubemq_msg_refs[dt] = msg_ref
+                    buffer.append((payload, msg_ref))
+
+        logger.debug("Message received from queue '%s'", sanitized)
+        return first_payload
 
     def _purge(self, queue: str) -> int:
         """Purge all messages from a KubeMQ Queue channel.
@@ -344,7 +356,7 @@ class Channel(virtual.Channel):
                 wait_time_seconds=max(0, int(self.purge_wait_seconds)),
             )
         except (KubeMQMessageError, KubeMQChannelError) as exc:
-            if _is_not_found(exc):
+            if is_not_found(exc):
                 return 0
             raise
 
@@ -422,9 +434,44 @@ class Channel(virtual.Channel):
         else:
             super().basic_reject(delivery_tag, requeue=requeue)
 
+    def _drain_batch_buffers(self) -> None:
+        """Nack all buffered messages on shutdown.
+
+        Called by atexit handler and close(). Provides crash safety for
+        buffered messages that haven't been delivered to Celery yet.
+        Uses nack() only -- KubeMQ's native visibility timeout handles
+        redelivery of nacked messages automatically.
+        """
+        for queue_name, buffer in list(self._batch_buffers.items()):
+            lock = self._batch_buffer_locks.get(queue_name)
+            acquired = lock.acquire(timeout=2.0) if lock else False
+            try:
+                while buffer:
+                    _payload, msg_ref = buffer.popleft()
+                    try:
+                        msg_ref.nack()
+                    except Exception:
+                        logger.debug(
+                            "Failed to nack buffered message on %s during drain",
+                            queue_name,
+                        )
+            finally:
+                if acquired:
+                    lock.release()
+        self._batch_buffers.clear()
+
     def close(self) -> None:
         """Clean up KubeMQ client resources."""
         self._closed = True
+        # Unregister atexit handler to avoid stale callback leak (M-3)
+        atexit.unregister(self._drain_batch_buffers)
+
+        # Drain batch buffers first (nack undelivered messages)
+        try:
+            self._drain_batch_buffers()
+        except Exception:
+            logger.debug("Error draining batch buffers during close")
+
         # Cancel all fanout subscriptions (lock protects against
         # concurrent _subscribe_fanout / _on_fanout_event calls)
         with self._fanout_lock:
@@ -458,19 +505,46 @@ class Channel(virtual.Channel):
         # MUST call super().close() -- cancels consumers, restores unacked
         super().close()
 
-    # --- Fanout methods ---
+    # --- Queue binding (required when supports_fanout = True) ---
+
+    def _queue_bind(self, exchange: str, routing_key: str, pattern: Any, queue: str) -> None:
+        """Bind a queue to an exchange.
+
+        Called by virtual.Channel.queue_bind() when supports_fanout is True.
+        For fanout exchanges, subscribes to KubeMQ Events on the exchange channel.
+        For direct/topic exchanges, this is a no-op (KubeMQ queues handle
+        routing natively).
+        """
+        try:
+            exchange_type = self.typeof(exchange).type
+        except (KeyError, AttributeError):
+            exchange_type = "direct"
+
+        if exchange_type == "fanout":
+            self._subscribe_fanout(exchange)
 
     def _put_fanout(
-        self, exchange: str, message: dict, routing_key: str | None = None, **kwargs: Any
+        self,
+        exchange: str,
+        message: dict,
+        routing_key: str = "",
+        **kwargs: Any,
     ) -> None:
-        """Publish to all subscribers via KubeMQ Events."""
+        """Publish a message to a fanout exchange via KubeMQ Events.
+
+        Kombu calls this for fanout exchanges (broadcast, remote control,
+        pidbox, inspect). Publishes as a fire-and-forget KubeMQ event so
+        all subscribed workers receive the message.
+        """
         body = json.dumps(message).encode("utf-8")
         event = EventMessage(
             channel=sanitize_queue_name(exchange),
             body=body,
-            metadata=json.dumps({"routing_key": routing_key or ""}),
         )
-        self._kubemq_pubsub_client.send_event(event)
+        self._kubemq_pubsub_client.publish_event(event)
+        logger.debug("Fanout message published to exchange '%s'", exchange)
+
+    # --- Fanout methods ---
 
     def _subscribe_fanout(self, exchange: str) -> None:
         """Subscribe to fanout exchange via KubeMQ Events.
@@ -495,6 +569,7 @@ class Channel(virtual.Channel):
             )
             self._kubemq_pubsub_client.subscribe_to_events(subscription, cancel)
             self._fanout_subscriptions[exchange] = cancel
+            logger.info("Subscribed to fanout exchange '%s'", exchange)
 
     def _send_fanout_queue_message(self, queue: str, message: dict) -> None:
         """Deliver fanout to a worker queue without task delay/DLQ policies."""
@@ -516,13 +591,8 @@ class Channel(virtual.Channel):
         """
         if self._closed:
             return
-        try:
-            message = json.loads(event.body)
-        except json.JSONDecodeError as exc:
-            logger.warning("Error decoding fanout event on %s: %s", exchange, exc)
-            return
-        if not isinstance(message, dict):
-            logger.warning("Fanout event on %s is not a JSON object", exchange)
+        message = self._decode_fanout_event(event.body)
+        if message is None:
             return
         try:
             with self._fanout_lock:
@@ -536,9 +606,15 @@ class Channel(virtual.Channel):
                 logger.warning("Error dispatching fanout message to %s: %s", queue, exc)
 
     def _on_fanout_error(self, exchange: str, err: Any) -> None:
-        """Handle fanout subscription error."""
+        """Handle fanout subscription error with exponential backoff re-subscription.
+
+        Attempts re-subscription up to fanout_max_retries times with backoff:
+        1s, 2s, 4s, 8s, max 30s. After max retries exhausted, gives up until
+        worker restart (interview decision #10).
+        """
         logger.warning("Fanout subscription error on %s: %s", exchange, err)
-        cancel_token = None
+
+        # Cancel the failed subscription
         with self._fanout_lock:
             cancel_token = self._fanout_subscriptions.pop(exchange, None)
         if cancel_token:
@@ -547,29 +623,49 @@ class Channel(virtual.Channel):
             except Exception:
                 pass
 
-    def _put_fanout_message(self, exchange: str, message: dict) -> None:
-        """Inject a received fanout message into the virtual layer's buffer.
+        if self._closed:
+            return
 
-        Uses the public self._put(queue, message) method for each queue
-        bound to this exchange, which is the standard Kombu virtual
-        transport approach for delivering fanout messages.
+        # Attempt re-subscription with exponential backoff
+        max_retries = max(0, int(self.fanout_max_retries))
+        backoff = 1.0  # initial backoff in seconds
+        max_backoff = 30.0
 
-        IMPLEMENTATION NOTE: Verify the exact Kombu virtual.Channel
-        mechanism for looking up exchange->queue bindings. In Kombu >=5.4,
-        check virtual.Channel._lookup() or the exchange-to-queue binding
-        table. The _lookup(exchange, routing_key) method returns the list
-        of queues bound to an exchange and is the public API for this.
-        Adjust the binding lookup below if Kombu internals differ.
-        """
-        # Use Kombu's exchange-to-queue binding lookup to find
-        # all queues bound to this fanout exchange, then deliver
-        # the message to each via the public _put() method.
-        try:
-            queues = self._lookup(exchange, "")
-        except Exception:
-            queues = []
-        for queue in queues:
-            self._put(queue, message)
+        for attempt in range(1, max_retries + 1):
+            if self._closed:
+                return
+
+            self._backoff_sleep(min(backoff, max_backoff))
+
+            # Re-check after sleep -- channel may have been closed during backoff
+            if self._closed:
+                return
+
+            try:
+                self._subscribe_fanout(exchange)
+                logger.info(
+                    "Fanout subscription recovered for exchange '%s' after %d retries",
+                    exchange,
+                    attempt,
+                )
+                return
+            except Exception as retry_err:
+                logger.warning(
+                    "Fanout re-subscription attempt %d/%d failed for '%s': %s",
+                    attempt,
+                    max_retries,
+                    exchange,
+                    retry_err,
+                )
+                backoff *= 2  # exponential backoff
+
+        # Max retries exhausted -- give up until restart
+        logger.error(
+            "Fanout subscription permanently lost for exchange '%s'. "
+            "Worker monitoring/control may be unavailable. "
+            "Restart worker to recover.",
+            exchange,
+        )
 
     # --- Advanced feature methods ---
 
@@ -603,7 +699,7 @@ class Channel(virtual.Channel):
                 return 0
             return len(getattr(peek, "messages", []) or [])
         except KubeMQChannelError as exc:
-            if _is_not_found(exc):
+            if is_not_found(exc):
                 return 0
             raise
 
@@ -614,7 +710,7 @@ class Channel(virtual.Channel):
                 channel=sanitize_queue_name(queue),
             )
         except KubeMQChannelError as exc:
-            if _is_not_found(exc):
+            if is_not_found(exc):
                 return
             raise
 
@@ -631,7 +727,7 @@ class Channel(virtual.Channel):
             )
             return any(ch.name == sanitized for ch in channels)
         except KubeMQChannelError as exc:
-            if _is_not_found(exc):
+            if is_not_found(exc):
                 return False
             raise
 
@@ -678,7 +774,13 @@ class Transport(virtual.Transport):
         return {"hostname": "localhost", "port": self.default_port}
 
     def establish_connection(self) -> Transport:
-        """Validate connection by pinging KubeMQ broker."""
+        """Validate connection by pinging KubeMQ broker.
+
+        Uses SDK ping() method directly via a temporary QueuesClient
+        without creating a full Kombu channel.
+        """
+        from kubemq_celery.exceptions import KubeMQCeleryConnectionError
+
         conninfo = self.client
         # Parse TLS from URL scheme
         if (
@@ -687,35 +789,76 @@ class Transport(virtual.Transport):
             and "+tls" in str(conninfo.transport)
         ):
             conninfo.ssl = True
+
         conn = super().establish_connection()
-        # Trigger channel creation to verify connectivity
-        channel = self.create_channel(conn)
+
+        host = conninfo.hostname or "localhost"
+        port = int(conninfo.port or 50000)
+        tls = bool(conninfo.ssl)
+        address = format_grpc_address(host, port)
+
+        # Build TLS config from transport options (same material as runtime channels)
+        transport_options = getattr(conninfo, "transport_options", None)
+        if not isinstance(transport_options, dict):
+            transport_options = {}
+        tls_config = TLSConfig(
+            enabled=tls,
+            cert_file=transport_options.get("tls_cert_file") or None,
+            key_file=transport_options.get("tls_key_file") or None,
+            ca_file=transport_options.get("tls_ca_file") or None,
+        )
+
         try:
-            _ = channel._kubemq_queues_client
-            channel._kubemq_queues_client.ping()
-            _ = channel._kubemq_pubsub_client
-        except Exception:
+            ping_client = QueuesClient(
+                config=ClientConfig(
+                    address=address,
+                    client_id=f"celery-ping-{uuid4().hex[:8]}",
+                    auth_token=conninfo.password or None,
+                    tls=tls_config,
+                )
+            )
             try:
-                channel.close()
-            except Exception:
-                pass
-            raise
-        # Close the temporary verification channel to avoid leaking
-        # a gRPC connection. The real working channel is created later
-        # by Kombu when it calls create_channel() on the returned conn.
-        channel.close()
+                ping_client.ping()
+            finally:
+                ping_client.close()
+        except (
+            KubeMQConnectionError,
+            KubeMQAuthenticationError,
+            KubeMQConnectionNotReadyError,
+            KubeMQTimeoutError,
+        ) as exc:
+            raise KubeMQCeleryConnectionError(
+                f"Failed to connect to KubeMQ broker at {address}: {exc}"
+            ) from exc
+        except (ConnectionError, TimeoutError, OSError) as exc:
+            raise KubeMQCeleryConnectionError(
+                f"Network error connecting to KubeMQ broker at {address}: {exc}"
+            ) from exc
+
+        logger.info(
+            "KubeMQ connection established to %s:%d (TLS: %s)",
+            host,
+            port,
+            tls,
+        )
         return conn
 
     def close_connection(self, connection) -> None:
         """Close connection and all channels."""
+        logger.info("KubeMQ connection closed")
         super().close_connection(connection)
 
     def verify_connection(self, connection) -> bool:
-        """Check if connection is alive via ping."""
+        """Check if connection is alive via ping.
+
+        Checks active channels first (Kombu moves healthy channels from
+        _avail_channels to self.channels), then falls back to available.
+        """
         try:
-            if not self._avail_channels:
+            channels = self.channels or self._avail_channels
+            if not channels:
                 return False
-            channel = next(iter(self._avail_channels))
+            channel = next(iter(channels))
             channel._kubemq_queues_client.ping()
             return True
         except Exception:

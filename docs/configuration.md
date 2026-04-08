@@ -9,6 +9,8 @@ Complete reference for all `kubemq-celery` configuration options.
 ```
 kubemq://[:token@]host[:port]
 kubemq+tls://[:token@]host[:port]
+kubemq+async://[:token@]host[:port]
+kubemq+async+tls://[:token@]host[:port]
 ```
 
 ### Examples
@@ -28,14 +30,22 @@ app.conf.broker_url = "kubemq+tls://kubemq.default.svc:50000"
 
 # TLS + authentication
 app.conf.broker_url = "kubemq+tls://:my-token@kubemq.default.svc:50000"
+
+# Async transport (for asyncio worker pools)
+app.conf.broker_url = "kubemq+async://localhost:50000"
+
+# Async + TLS
+app.conf.broker_url = "kubemq+async+tls://kubemq.default.svc:50000"
 ```
 
 | Component | Description | Default |
 |-----------|-------------|---------|
-| Scheme | `kubemq://` or `kubemq+tls://` | Required |
+| Scheme | `kubemq://`, `kubemq+tls://`, `kubemq+async://`, or `kubemq+async+tls://` | Required |
 | Token | Authentication token (after `:`, before `@`) | None |
 | Host | KubeMQ broker hostname | `localhost` |
 | Port | KubeMQ gRPC port | `50000` |
+
+The `kubemq+async://` and `kubemq+async+tls://` schemes use native async KubeMQ clients (`AsyncQueuesClient`, `AsyncPubSubClient`) for non-blocking I/O. Use with Celery's asyncio worker pool (`--pool=asyncio`).
 
 ## Transport Options
 
@@ -54,6 +64,12 @@ app.conf.broker_transport_options = {
     "tls_ca_file": "/path/to/ca.pem",
     "max_send_size": 4_194_304,
     "max_receive_size": 4_194_304,
+    "message_expiration": 3600,
+    "max_batch_size": 10,
+    "fanout_max_retries": 5,
+    "grpc_keepalive_time": 30,
+    "grpc_keepalive_timeout": 10,
+    "grpc_permit_without_calls": True,
 }
 ```
 
@@ -72,6 +88,12 @@ app.conf.broker_transport_options = {
 | `tls_ca_file` | `str` | `""` | Path to CA certificate file for custom certificate authority verification. |
 | `max_send_size` | `int` | `4_194_304` | Maximum gRPC send message size in bytes (default 4MB). Increase for large task payloads. |
 | `max_receive_size` | `int` | `4_194_304` | Maximum gRPC receive message size in bytes (default 4MB). Increase for large task results. |
+| `message_expiration` | `int` | `0` | Per-message TTL in seconds. Messages older than this are discarded by KubeMQ. Set to `0` to disable (no expiration). Maximum 86400 (24 hours). Task-level `expires` header takes precedence if set. |
+| `max_batch_size` | `int` | `10` | Maximum messages per gRPC receive call. Higher values reduce round-trips but increase memory. Range: 1-100. |
+| `fanout_max_retries` | `int` | `5` | Maximum re-subscription attempts when a fanout subscription (Events) encounters an error. Uses exponential backoff (1s, 2s, 4s, ... max 30s). |
+| `grpc_keepalive_time` | `int` | `30` | Seconds between gRPC keepalive pings. Prevents idle connections from being dropped by load balancers or firewalls. |
+| `grpc_keepalive_timeout` | `int` | `10` | Seconds to wait for a keepalive ping response before considering the connection dead. |
+| `grpc_permit_without_calls` | `bool` | `True` | Send keepalive pings even when there are no active RPCs. Set to `True` for long-lived connections that may be idle between task bursts. |
 
 ### TLS Configuration Examples
 
@@ -119,7 +141,7 @@ The queue-peek result backend stores task results as KubeMQ Queue messages and r
 ```python
 app.conf.update(
     result_backend="kubemq://localhost:50000",
-    result_expires=43200,  # 12 hours (KubeMQ maximum)
+    result_expires=86400,  # 24 hours (KubeMQ maximum)
 )
 ```
 
@@ -139,8 +161,8 @@ app.conf.result_backend_transport_options = {
 
 - Results are stored on per-task channels: `celery-result-{task_id}`
 - Retrieval uses `peek_queue_messages()` (non-destructive) -- multiple callers can read the same result
-- Maximum result expiration is 43200 seconds (12 hours), which is a KubeMQ limitation
-- Celery's default `result_expires` of 24 hours is automatically capped to 12 hours
+- Maximum result expiration is 86400 seconds (24 hours), which is a KubeMQ limitation
+- Celery's default `result_expires` of 24 hours matches the KubeMQ maximum
 - State transitions (PENDING -> STARTED -> SUCCESS) purge and rewrite the result message
 - Chord support uses Celery's polling fallback (`chord_unlock` task)
 
@@ -148,7 +170,7 @@ app.conf.result_backend_transport_options = {
 
 | Celery Setting | Support | Notes |
 |---------------|---------|-------|
-| `broker_url` | Full | `kubemq://` and `kubemq+tls://` schemes |
+| `broker_url` | Full | `kubemq://`, `kubemq+tls://`, `kubemq+async://`, `kubemq+async+tls://` schemes |
 | `broker_transport_options` | Full | All options listed above |
 | `broker_pool_limit` | Ignored | Single client per Channel; Kombu connection pool handles scaling |
 | `broker_connection_timeout` | Full | Passed to SDK connection timeout |
@@ -165,7 +187,7 @@ app.conf.result_backend_transport_options = {
 | `worker_prefetch_multiplier` | Full | Managed by Kombu's virtual QoS layer |
 | `worker_concurrency` | Full | Standard Celery behavior |
 | `result_backend` | Full | `kubemq://` for queue-peek result backend |
-| `result_expires` | Full | Controls result message expiration (max 12 hours) |
+| `result_expires` | Full | Controls result message expiration (max 24 hours) |
 
 ### `task_acks_late` Caveats
 
@@ -219,7 +241,7 @@ app.conf.update(
 
     # Result backend
     result_backend="kubemq://kubemq.default.svc:50000",
-    result_expires=43200,  # 12 hours
+    result_expires=86400,  # 24 hours
 
     # Task settings
     task_acks_late=False,

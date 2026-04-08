@@ -1,11 +1,13 @@
-# Docker Compose quickstart for kubemq-celery
+# Docker Compose: multi-worker KubeMQ Celery setup
 #
-# Starts a KubeMQ broker and Celery worker for local development.
+# Starts a KubeMQ broker, 2 Celery workers (different queues),
+# and a Beat scheduler for local development.
 #
 # Usage:
-#   docker compose up -d          # start all services
-#   docker compose logs -f worker # watch worker logs
-#   docker compose down           # stop all services
+#   docker compose up -d                   # start all services
+#   docker compose logs -f worker-default  # watch default worker
+#   docker compose logs -f worker-priority # watch priority worker
+#   docker compose down                    # stop all services
 #
 # KubeMQ Dashboard: http://localhost:9090
 # Flower (if enabled): http://localhost:5555
@@ -26,12 +28,40 @@ services:
       retries: 3
       start_period: 10s
 
-  # Celery worker
-  worker:
+  # Worker 1: default queue
+  worker-default:
     build:
       context: ../..
       dockerfile: examples/kubernetes/Dockerfile
-    command: celery -A basic_task worker --loglevel=info --concurrency=2
+    command: celery -A basic_task worker --loglevel=info -Q celery --concurrency=2
+    environment:
+      - CELERY_BROKER_URL=kubemq://kubemq:50000
+      - CELERY_RESULT_BACKEND=kubemq://kubemq:50000
+    depends_on:
+      kubemq:
+        condition: service_healthy
+    restart: unless-stopped
+
+  # Worker 2: high-priority queue
+  worker-priority:
+    build:
+      context: ../..
+      dockerfile: examples/kubernetes/Dockerfile
+    command: celery -A basic_task worker --loglevel=info -Q high-priority --concurrency=2
+    environment:
+      - CELERY_BROKER_URL=kubemq://kubemq:50000
+      - CELERY_RESULT_BACKEND=kubemq://kubemq:50000
+    depends_on:
+      kubemq:
+        condition: service_healthy
+    restart: unless-stopped
+
+  # Beat scheduler
+  beat:
+    build:
+      context: ../..
+      dockerfile: examples/kubernetes/Dockerfile
+    command: celery -A basic_task beat --loglevel=info
     environment:
       - CELERY_BROKER_URL=kubemq://kubemq:50000
       - CELERY_RESULT_BACKEND=kubemq://kubemq:50000
@@ -53,14 +83,3 @@ services:
   #   depends_on:
   #     kubemq:
   #       condition: service_healthy
-
-# Example Dockerfile (examples/kubernetes/Dockerfile):
-#
-#   FROM python:3.12-slim
-#   WORKDIR /app
-#   COPY pyproject.toml .
-#   RUN pip install --no-cache-dir .
-#   COPY src/ src/
-#   COPY examples/ examples/
-#   ENV PYTHONPATH=/app/src:/app/examples
-#   CMD ["celery", "-A", "basic_task", "worker", "--loglevel=info"]

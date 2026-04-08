@@ -1,0 +1,10 @@
+# Django + KubeMQ Celery dependencies
+django>=4.2
+celery>=5.4
+kubemq-celery>=1.1.0
+
+# Dynamic periodic tasks via Django admin
+django-celery-beat>=2.6
+
+# Store task results in Django DB (optional, for admin visibility)
+django-celery-results>=2.5

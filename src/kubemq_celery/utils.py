@@ -3,6 +3,15 @@
 from __future__ import annotations
 
 import re
+from urllib.parse import unquote, urlsplit
+
+from kubemq.core.exceptions import ErrorCode
+
+
+def is_not_found(exc: BaseException) -> bool:
+    """Check if a KubeMQ exception has a NOT_FOUND error code."""
+    return getattr(exc, "code", None) == ErrorCode.NOT_FOUND
+
 
 # Characters that need replacement in KubeMQ channel names
 _SANITIZE_MAP = str.maketrans(
@@ -61,19 +70,6 @@ def format_grpc_address(hostname: str, port: int) -> str:
     return f"{hn}:{port}"
 
 
-def parse_broker_url(url: str) -> dict:
-    """Parse kubemq:// or kubemq+tls:// URL into connection params.
-
-    Format: kubemq://[:token@]host[:port][/vhost]
-
-    Returns dict with: tls_enabled (bool).
-    Kombu handles most URL parsing via conninfo -- this extracts
-    transport-specific URL logic only.
-    """
-    tls_enabled = "+tls" in url.split("://")[0] if "://" in url else False
-    return {"tls_enabled": tls_enabled}
-
-
 def parse_result_url(url: str) -> dict:
     """Parse kubemq:// or kubemq+tls:// result backend URL.
 
@@ -82,45 +78,44 @@ def parse_result_url(url: str) -> dict:
     Returns dict with: hostname (str), port (int), auth_token (str|None),
     tls_enabled (bool).
 
-    Used by KubeMQResultBackend to extract connection parameters from
-    the result_backend URL (spec section 5.3).
-    """
-    hostname = "localhost"
-    port = 50000
-    auth_token = None
-    tls_enabled = "+tls" in url.split("://")[0] if "://" in url else False
+    Accepts both raw URLs (``kubemq+tls://...``) and Celery-normalized
+    URLs (``tls://...``) for TLS detection.
 
-    if url and "://" in url:
-        _scheme, rest = url.split("://", 1)
-        # Handle auth: kubemq://:token@host:port
-        if "@" in rest:
-            creds_part, host_part = rest.rsplit("@", 1)
-            auth_token = creds_part.lstrip(":")
-        else:
-            host_part = rest
-        # Strip vhost
-        host_part = host_part.split("/")[0]
-        # IPv6: [::1]:50000
-        if host_part.startswith("["):
-            end = host_part.find("]")
-            if end != -1:
-                hostname = host_part[1:end]
-                port = 50000
-                if len(host_part) > end + 1 and host_part[end + 1] == ":":
-                    try:
-                        port = int(host_part[end + 2 :])
-                    except ValueError:
-                        port = 50000
-            else:
-                hostname = host_part
-        elif ":" in host_part:
-            hostname, port_str = host_part.rsplit(":", 1)
-            try:
-                port = int(port_str)
-            except ValueError:
-                port = 50000
-        else:
-            hostname = host_part
+    Raises ``ValueError`` on malformed host or port values.
+    """
+    if not url:
+        return {
+            "hostname": "localhost",
+            "port": 50000,
+            "auth_token": None,
+            "tls_enabled": False,
+        }
+
+    # urlsplit needs a recognized scheme to parse authority correctly.
+    # Replace kubemq[-variant]:// with http:// for parsing, but remember the scheme.
+    original_scheme = url.split("://")[0] if "://" in url else ""
+    tls_enabled = "tls" in original_scheme.lower()
+
+    # Normalize scheme for urlsplit
+    if "://" in url:
+        normalized = "http://" + url.split("://", 1)[1]
+    else:
+        normalized = "http://" + url
+
+    parts = urlsplit(normalized)
+
+    # Extract auth token (percent-decoded)
+    auth_token = None
+    if parts.password:
+        auth_token = unquote(parts.password)
+    elif parts.username:
+        auth_token = unquote(parts.username)
+
+    # Extract hostname
+    hostname = parts.hostname or "localhost"
+
+    # Extract port
+    port = parts.port or 50000
 
     return {
         "hostname": hostname,

@@ -196,20 +196,41 @@ app.conf.update(
 
 ### Worker Dockerfile
 
+A production-ready Dockerfile is provided at [`examples/kubernetes/Dockerfile`](../examples/kubernetes/Dockerfile):
+
 ```dockerfile
 FROM python:3.12-slim
 
 WORKDIR /app
 
-# Install dependencies
+# Install uv and dependencies
+COPY --from=ghcr.io/astral-sh/uv:latest /uv /usr/local/bin/uv
 COPY pyproject.toml .
-RUN pip install --no-cache-dir .
+RUN uv pip install --system --no-cache .
 
-# Copy application
-COPY . .
+# Copy application code
+COPY src/ src/
+COPY examples/ examples/
 
-# Default command (overridden in K8s deployment)
-CMD ["celery", "-A", "myapp", "worker", "--loglevel=info"]
+ENV PYTHONPATH=/app/src:/app/examples
+
+# Health check
+HEALTHCHECK --interval=30s --timeout=10s --retries=3 \
+    CMD python -c "import kubemq_celery; print('ok')" || exit 1
+
+CMD ["celery", "-A", "basic_task", "worker", "--loglevel=info"]
+```
+
+### Multi-Worker Docker Compose
+
+The provided [`examples/kubernetes/docker-compose.yaml`](../examples/kubernetes/docker-compose.yaml) includes a multi-worker setup with:
+- 2 workers on different queues (default + high-priority)
+- 1 Beat scheduler for periodic tasks
+- 1 KubeMQ broker with health checks
+
+```bash
+cd examples/kubernetes
+docker compose up -d
 ```
 
 ## 3. Service Discovery
@@ -429,6 +450,6 @@ The dashboard shows queue depth, message rates, and channel statistics -- comple
 - [ ] KEDA ScaledObject configured for queue-depth autoscaling
 - [ ] Flower deployed for task monitoring
 - [ ] Dead letter queue configured for failed messages
-- [ ] `result_expires` set to <= 43200 (12 hours)
+- [ ] `result_expires` set to <= 86400 (24 hours)
 - [ ] Worker `--concurrency` matched to workload type (I/O vs CPU bound)
 - [ ] Network policies restrict broker access to worker namespaces

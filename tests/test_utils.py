@@ -4,7 +4,7 @@ from __future__ import annotations
 
 import pytest
 
-from kubemq_celery.utils import parse_broker_url, parse_result_url, sanitize_queue_name
+from kubemq_celery.utils import parse_result_url, sanitize_queue_name
 
 
 class TestSanitizeQueueName:
@@ -42,20 +42,6 @@ class TestSanitizeQueueName:
             sanitize_queue_name("")
 
 
-class TestParseBrokerUrl:
-    def test_basic_url(self):
-        result = parse_broker_url("kubemq://localhost:50000")
-        assert result["tls_enabled"] is False
-
-    def test_tls_url(self):
-        result = parse_broker_url("kubemq+tls://localhost:50000")
-        assert result["tls_enabled"] is True
-
-    def test_no_scheme(self):
-        result = parse_broker_url("localhost:50000")
-        assert result["tls_enabled"] is False
-
-
 class TestParseResultUrl:
     def test_basic_url(self):
         result = parse_result_url("kubemq://localhost:50000")
@@ -86,11 +72,22 @@ class TestParseResultUrl:
         assert result["hostname"] == "localhost"
         assert result["port"] == 50000
 
-    def test_invalid_port_fallback(self):
-        """Verify invalid port falls back to 50000."""
-        result = parse_result_url("kubemq://localhost:notaport")
-        assert result["hostname"] == "localhost"
-        assert result["port"] == 50000
+    def test_invalid_port_raises(self):
+        """Verify invalid port raises ValueError (fail-fast, not silent default)."""
+        with pytest.raises(ValueError, match="Port"):
+            parse_result_url("kubemq://localhost:notaport")
+
+    def test_celery_normalized_tls_url(self):
+        """Verify Celery-normalized tls:// scheme enables TLS."""
+        result = parse_result_url("tls://myhost:50001")
+        assert result["hostname"] == "myhost"
+        assert result["port"] == 50001
+        assert result["tls_enabled"] is True
+
+    def test_percent_encoded_auth(self):
+        """Verify percent-encoded auth token is decoded."""
+        result = parse_result_url("kubemq://:my%40token@localhost:50000")
+        assert result["auth_token"] == "my@token"
 
     def test_url_with_vhost(self):
         """Verify vhost is stripped from URL."""
@@ -102,6 +99,30 @@ class TestParseResultUrl:
         result = parse_result_url("kubemq://[::1]:50001")
         assert result["hostname"] == "::1"
         assert result["port"] == 50001
+
+
+class TestFormatGrpcAddress:
+    """Tests for format_grpc_address."""
+
+    def test_basic(self):
+        from kubemq_celery.utils import format_grpc_address
+
+        assert format_grpc_address("localhost", 50000) == "localhost:50000"
+
+    def test_ipv6_bare(self):
+        from kubemq_celery.utils import format_grpc_address
+
+        assert format_grpc_address("::1", 50000) == "[::1]:50000"
+
+    def test_ipv6_bracketed(self):
+        from kubemq_celery.utils import format_grpc_address
+
+        assert format_grpc_address("[::1]", 50000) == "[::1]:50000"
+
+    def test_empty_hostname(self):
+        from kubemq_celery.utils import format_grpc_address
+
+        assert format_grpc_address("", 50000) == "localhost:50000"
 
 
 class TestSanitizeQueueNameEdgeCases:
@@ -121,3 +142,23 @@ class TestSanitizeQueueNameEdgeCases:
         result = sanitize_queue_name("q@a!b#c")
         # @ -> ., # -> ., ! stripped
         assert result == "q.a.b.c" or result == "q.ab.c"
+
+
+class TestParseResultUrlIPv6Edge:
+    """Edge case for IPv6 bracket parsing in parse_result_url."""
+
+    def test_ipv6_with_invalid_port(self):
+        """Verify IPv6 URL with invalid port raises ValueError."""
+        with pytest.raises(ValueError, match="Port"):
+            parse_result_url("kubemq://[::1]:badport")
+
+    def test_ipv6_no_port(self):
+        """Verify IPv6 URL without port uses default 50000."""
+        result = parse_result_url("kubemq://[::1]")
+        assert result["hostname"] == "::1"
+        assert result["port"] == 50000
+
+    def test_ipv6_unclosed_bracket(self):
+        """Verify IPv6 URL with unclosed bracket raises ValueError."""
+        with pytest.raises(ValueError):
+            parse_result_url("kubemq://[::1")

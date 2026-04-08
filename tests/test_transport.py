@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-from unittest.mock import MagicMock, PropertyMock, patch
+from unittest.mock import MagicMock, patch
 
 import pytest
 
@@ -147,56 +147,89 @@ class TestTransport:
         assert result is False
 
     def test_establish_connection_success(self):
-        """Verify establish_connection() creates and verifies a channel."""
+        """Verify establish_connection() pings broker via temporary QueuesClient."""
         transport = Transport.__new__(Transport)
         mock_conninfo = MagicMock()
         mock_conninfo.transport_cls = "kubemq"
+        mock_conninfo.hostname = "localhost"
+        mock_conninfo.port = 50000
+        mock_conninfo.password = None
+        mock_conninfo.ssl = False
         transport.client = mock_conninfo
 
         mock_conn = MagicMock()
-        mock_channel = MagicMock()
 
-        with patch.object(Transport.__bases__[0], "establish_connection", return_value=mock_conn):
-            with patch.object(transport, "create_channel", return_value=mock_channel):
-                result = transport.establish_connection()
+        with (
+            patch.object(Transport.__bases__[0], "establish_connection", return_value=mock_conn),
+            patch("kubemq_celery.transport.QueuesClient") as MockClient,
+        ):
+            mock_ping_client = MagicMock()
+            MockClient.return_value = mock_ping_client
+            result = transport.establish_connection()
 
         assert result is mock_conn
-        # Channel should have been closed after verification
-        mock_channel.close.assert_called_once()
+        mock_ping_client.ping.assert_called_once()
+        mock_ping_client.close.assert_called_once()
 
     def test_establish_connection_tls_from_url(self):
         """Verify establish_connection() sets ssl=True when +tls in transport string."""
         transport = Transport.__new__(Transport)
         mock_conninfo = MagicMock()
         mock_conninfo.transport = "kubemq+tls"
+        mock_conninfo.hostname = "localhost"
+        mock_conninfo.port = 50000
+        mock_conninfo.password = None
         transport.client = mock_conninfo
 
         mock_conn = MagicMock()
-        mock_channel = MagicMock()
 
-        with patch.object(Transport.__bases__[0], "establish_connection", return_value=mock_conn):
-            with patch.object(transport, "create_channel", return_value=mock_channel):
-                transport.establish_connection()
+        with (
+            patch.object(Transport.__bases__[0], "establish_connection", return_value=mock_conn),
+            patch("kubemq_celery.transport.QueuesClient") as MockClient,
+        ):
+            mock_ping_client = MagicMock()
+            MockClient.return_value = mock_ping_client
+            transport.establish_connection()
 
         assert mock_conninfo.ssl is True
 
-    def test_establish_connection_failure_closes_channel(self):
-        """Verify establish_connection() closes channel on failure and re-raises."""
+    def test_establish_connection_failure_raises(self):
+        """Verify establish_connection() raises on connection failure."""
+        from kubemq.core.exceptions import KubeMQConnectionError
+
+        from kubemq_celery.exceptions import KubeMQCeleryConnectionError
+
         transport = Transport.__new__(Transport)
         mock_conninfo = MagicMock()
         mock_conninfo.transport_cls = "kubemq"
+        mock_conninfo.hostname = "localhost"
+        mock_conninfo.port = 50000
+        mock_conninfo.password = None
+        mock_conninfo.ssl = False
         transport.client = mock_conninfo
 
         mock_conn = MagicMock()
-        mock_channel = MagicMock()
-        # Accessing the queues client property triggers an error
-        type(mock_channel)._kubemq_queues_client = PropertyMock(
-            side_effect=RuntimeError("connection refused")
-        )
 
-        with patch.object(Transport.__bases__[0], "establish_connection", return_value=mock_conn):
-            with patch.object(transport, "create_channel", return_value=mock_channel):
-                with pytest.raises(RuntimeError, match="connection refused"):
-                    transport.establish_connection()
+        with (
+            patch.object(Transport.__bases__[0], "establish_connection", return_value=mock_conn),
+            patch(
+                "kubemq_celery.transport.QueuesClient",
+                side_effect=KubeMQConnectionError("refused"),
+            ),
+        ):
+            with pytest.raises(KubeMQCeleryConnectionError, match="Failed to connect"):
+                transport.establish_connection()
 
-        mock_channel.close.assert_called_once()
+    def test_lifecycle_logging(self, caplog):
+        """C8: Verify lifecycle INFO logging on connection events."""
+        import logging
+
+        transport = Transport.__new__(Transport)
+
+        with (
+            caplog.at_level(logging.INFO, logger="kubemq_celery"),
+            patch.object(Transport.__bases__[0], "close_connection"),
+        ):
+            transport.close_connection(MagicMock())
+
+        assert any("connection closed" in r.message for r in caplog.records)

@@ -83,8 +83,8 @@ Workers connect to KubeMQ and start processing tasks immediately.
 | **Result backend** | Redis GET/SET | RPC or DB | Queue-peek (non-destructive read) |
 | **Protocol** | TCP | AMQP (TCP) | gRPC (HTTP/2) |
 | **Connection stability** | Connection resets under load | Stable | gRPC keep-alive, auto-reconnect |
-| **Max delay** | Unlimited (client polling) | Unlimited (plugin) | 12 hours (43200 seconds) |
-| **Max result expiry** | Unlimited | N/A (RPC: 24h default) | 12 hours (43200 seconds) |
+| **Max delay** | Unlimited (client polling) | Unlimited (plugin) | 24 hours (86400 seconds) |
+| **Max result expiry** | Unlimited | N/A (RPC: 24h default) | 24 hours (86400 seconds) |
 
 ## What Works the Same
 
@@ -131,8 +131,8 @@ app.conf.task_reject_on_worker_lost = True  # Maps to KubeMQ nack()
 task.apply_async(countdown=60)          # delivers after 60 seconds
 task.apply_async(eta=future_datetime)   # delivers at specific time
 
-# Limitation: max delay is 12 hours (43200 seconds)
-# Delays > 12h are capped at 12h with a warning log
+# Limitation: max delay is 24 hours (86400 seconds)
+# Delays > 24h are capped at 24h with a warning log
 ```
 
 ### Dead Letter Queue
@@ -159,7 +159,7 @@ app.conf.broker_transport_options = {
 ```python
 # Pure KubeMQ stack -- broker and results in one place
 app.conf.result_backend = "kubemq://localhost:50000"
-app.conf.result_expires = 43200  # max 12 hours
+app.conf.result_expires = 86400  # max 24 hours
 ```
 
 ### Queue Name Sanitization
@@ -189,13 +189,13 @@ from celery import Celery
 
 KubeMQ uses a single gRPC client per Channel. Kombu's connection pool handles scaling. Setting `broker_pool_limit` has no effect.
 
-### 3. Maximum delay is 12 hours
+### 3. Maximum delay is 24 hours
 
-KubeMQ's `delay_in_seconds` caps at 43200 seconds. If your tasks use `countdown` or `eta` values exceeding 12 hours, they will be capped. Use Celery Beat for longer scheduling needs.
+KubeMQ's `delay_in_seconds` caps at 86400 seconds. If your tasks use `countdown` or `eta` values exceeding 24 hours, they will be capped. Use Celery Beat for longer scheduling needs.
 
-### 4. Result expiration is 12 hours max
+### 4. Result expiration is 24 hours max
 
-KubeMQ queue message expiration caps at 43200 seconds. Celery's default `result_expires` of 24 hours is automatically capped. If you need longer result retention, use a database-backed result backend.
+KubeMQ queue message expiration caps at 86400 seconds. Celery's default `result_expires` of 24 hours matches the KubeMQ maximum. If you need longer result retention, use a database-backed result backend.
 
 ### 5. Priority is metadata only
 
@@ -211,6 +211,53 @@ app.conf.task_routes = {
 ### 6. Long-running tasks with `task_acks_late=True`
 
 When using `task_acks_late=True` with tasks that run longer than ~60 seconds, the KubeMQ transaction may expire before the ack is sent, causing redelivery. For long tasks, use `task_acks_late=False` (the default) or ensure your tasks are idempotent.
+
+## New in v1.1
+
+### Per-Message TTL
+
+Set a default message expiration for all tasks:
+
+```python
+app.conf.broker_transport_options = {
+    "message_expiration": 3600,  # 1 hour TTL for all messages
+}
+```
+
+Task-level `expires` header takes precedence. Maximum is 86400 seconds (24 hours).
+
+### Batch Receive Optimization
+
+Receive multiple messages per gRPC call to reduce round-trips:
+
+```python
+app.conf.broker_transport_options = {
+    "max_batch_size": 10,  # up to 100
+}
+```
+
+### Async Transport
+
+For asyncio-based worker pools (Starlette, Litestar, etc.):
+
+```python
+app.conf.broker_url = "kubemq+async://localhost:50000"
+# Start worker with: celery -A myapp worker --pool=asyncio
+```
+
+Also supports TLS: `kubemq+async+tls://`.
+
+### gRPC Keepalive
+
+Configurable keepalive for long-lived connections:
+
+```python
+app.conf.broker_transport_options = {
+    "grpc_keepalive_time": 30,       # ping every 30s
+    "grpc_keepalive_timeout": 10,    # wait 10s for response
+    "grpc_permit_without_calls": True,
+}
+```
 
 ## Redis-Specific Settings to Remove
 
