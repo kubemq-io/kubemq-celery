@@ -696,7 +696,7 @@ name = "exceptiongroup"
 version = "1.3.1"
 source = { registry = "https://pypi.org/simple" }
 dependencies = [
-    { name = "typing-extensions", marker = "python_full_version < '3.13'" },
+    { name = "typing-extensions", marker = "python_full_version < '3.12'" },
 ]
 sdist = { url = "https://files.pythonhosted.org/packages/50/79/66800aadf48771f6b62f7eb014e352e5d06856655206165d775e675a02c9/exceptiongroup-1.3.1.tar.gz", hash = "sha256:8b412432c6055b0b7d14c310000ae93352ed6754f70fa8f7c34141f91c4e3219", size = 30371, upload-time = "2025-11-21T23:01:54.787Z" }
 wheels = [
@@ -1023,7 +1023,7 @@ wheels = [
 
 [[package]]
 name = "kubemq"
-version = "4.1.1"
+version = "4.1.5"
 source = { registry = "https://pypi.org/simple" }
 dependencies = [
     { name = "grpcio" },
@@ -1032,9 +1032,9 @@ dependencies = [
     { name = "tomli", marker = "python_full_version < '3.11'" },
     { name = "typing-extensions", marker = "python_full_version < '3.11'" },
 ]
-sdist = { url = "https://files.pythonhosted.org/packages/bf/52/70f2c85a8033ec6befe26975def4c071ffd456ab0bbaf652109ee11d8eda/kubemq-4.1.1.tar.gz", hash = "sha256:3949a0a1049dc08efda199f99e4f032462e0382ded3048383e32886e444eb762", size = 320594, upload-time = "2026-04-05T14:48:31.974Z" }
+sdist = { url = "https://files.pythonhosted.org/packages/22/75/888e29acc820091e0d303953c7f7f59d593c8aae96833263111e609f250f/kubemq-4.1.5.tar.gz", hash = "sha256:b991e1ebbe35984e96bb77239f9649c62486fdf6478cb4c9098ea93aec349e89", size = 322465, upload-time = "2026-05-31T15:00:31.523Z" }
 wheels = [
-    { url = "https://files.pythonhosted.org/packages/2f/49/30d327bc3cbc3e99205ecf48947fee185f86c77f8bc61378cc2dd5b76fb4/kubemq-4.1.1-py3-none-any.whl", hash = "sha256:ac5663fab7bf319e697a9eec06b23f1123ff698d1a8d0abae27ff16ca3f4df09", size = 187080, upload-time = "2026-04-05T14:48:30.627Z" },
+    { url = "https://files.pythonhosted.org/packages/76/48/81bf2eed1b934547a1c3f021dcd2e2711a349bcbc068b1dbb78207289cb1/kubemq-4.1.5-py3-none-any.whl", hash = "sha256:81ec0e9e620603e2cc11447ccf6adc86d665f88f85adadf6d302e39bb8b0fd6e", size = 187192, upload-time = "2026-05-31T15:00:29.864Z" },
 ]
 
 [[package]]
@@ -1090,7 +1090,7 @@ requires-dist = [
     { name = "fastapi", marker = "extra == 'examples'", specifier = ">=0.100" },
     { name = "flask", marker = "extra == 'examples'", specifier = ">=3.0" },
     { name = "kombu", specifier = ">=5.4" },
-    { name = "kubemq", specifier = ">=4.1.1" },
+    { name = "kubemq", specifier = ">=4.1.5" },
     { name = "litestar", marker = "extra == 'examples'", specifier = ">=2.0" },
     { name = "msgpack", marker = "extra == 'examples'", specifier = ">=1.0" },
     { name = "pytest", marker = "extra == 'dev'", specifier = ">=9.0" },
