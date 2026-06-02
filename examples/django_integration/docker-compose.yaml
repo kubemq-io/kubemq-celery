@@ -1,0 +1,65 @@
+# Full-stack Docker Compose: Django + KubeMQ + Celery worker + Beat
+#
+# Usage:
+#   docker compose up -d          # start all services
+#   docker compose logs -f worker # watch worker logs
+#   docker compose down           # stop all services
+#
+# KubeMQ Dashboard: http://localhost:9090
+# Django app:       http://localhost:8000
+
+services:
+  # KubeMQ broker
+  kubemq:
+    image: kubemq/kubemq:latest
+    ports:
+      - "50000:50000"
+      - "9090:9090"
+    environment:
+      - KUBEMQ_LOG_LEVEL=info
+    healthcheck:
+      test: ["CMD", "wget", "--spider", "-q", "http://localhost:9090/health"]
+      interval: 10s
+      timeout: 5s
+      retries: 3
+      start_period: 10s
+
+  # Django web server
+  web:
+    build: .
+    command: python manage.py runserver 0.0.0.0:8000
+    ports:
+      - "8000:8000"
+    environment:
+      - CELERY_BROKER_URL=kubemq://kubemq:50000
+      - CELERY_RESULT_BACKEND=kubemq://kubemq:50000
+      - DJANGO_SECRET_KEY=dev-only-secret-key
+    depends_on:
+      kubemq:
+        condition: service_healthy
+
+  # Celery worker
+  worker:
+    build: .
+    command: celery -A myproject worker --loglevel=info --concurrency=2
+    environment:
+      - CELERY_BROKER_URL=kubemq://kubemq:50000
+      - CELERY_RESULT_BACKEND=kubemq://kubemq:50000
+      - DJANGO_SECRET_KEY=dev-only-secret-key
+    depends_on:
+      kubemq:
+        condition: service_healthy
+    restart: unless-stopped
+
+  # Celery Beat scheduler
+  beat:
+    build: .
+    command: celery -A myproject beat --loglevel=info
+    environment:
+      - CELERY_BROKER_URL=kubemq://kubemq:50000
+      - CELERY_RESULT_BACKEND=kubemq://kubemq:50000
+      - DJANGO_SECRET_KEY=dev-only-secret-key
+    depends_on:
+      kubemq:
+        condition: service_healthy
+    restart: unless-stopped
