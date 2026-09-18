@@ -32,10 +32,10 @@ uv add kubemq-celery
 
 ```bash
 # Docker
-docker run -d -p 50000:50000 -p 9090:9090 kubemq/kubemq:latest
+docker run -d -p 50000:50000 -p 9090:9090 europe-docker.pkg.dev/kubemq/images/kubemq-next:latest
 
 # Kubernetes
-kubectl apply -f https://get.kubemq.io/deploy
+helm repo add kubemq-next https://kubemq-io.github.io/charts-next && helm install kubemq-next kubemq-next/kubemq-next -n kubemq --create-namespace --set key=<license-key>
 ```
 
 ### 3. Update your Celery configuration

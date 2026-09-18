@@ -27,10 +27,10 @@ Deploy Celery workers with KubeMQ broker on Kubernetes.
 ### Quick Deploy
 
 ```bash
-kubectl apply -f https://get.kubemq.io/deploy
+helm repo add kubemq-next https://kubemq-io.github.io/charts-next && helm install kubemq-next kubemq-next/kubemq-next -n kubemq --create-namespace --set key=<license-key>
 ```
 
-This creates a KubeMQ StatefulSet in the `default` namespace with:
+This installs KubeMQ with Helm into the `kubemq` namespace with:
 - gRPC service on port 50000
 - Dashboard on port 9090
 - Persistent storage
@@ -56,7 +56,7 @@ spec:
     spec:
       containers:
         - name: kubemq
-          image: kubemq/kubemq:latest
+          image: europe-docker.pkg.dev/kubemq/images/kubemq-next:latest
           ports:
             - containerPort: 50000
               name: grpc

@@ -18,7 +18,7 @@ git clone https://github.com/kubemq/kubemq-celery.git && cd kubemq-celery
 pip install kubemq-celery
 
 # 2. Start a KubeMQ broker (Docker)
-docker run -d --name kubemq -p 50000:50000 kubemq/kubemq-community:latest
+docker run -d --name kubemq -p 50000:50000 europe-docker.pkg.dev/kubemq/images/kubemq-next:latest
 
 # 3. Run a basic example (no worker needed for eager mode)
 python examples/testing/eager_mode.py

@@ -23,7 +23,7 @@ uv pip install -r requirements.txt
 ### 2. Start KubeMQ broker
 
 ```bash
-docker run -d -p 50000:50000 -p 9090:9090 kubemq/kubemq:latest
+docker run -d -p 50000:50000 -p 9090:9090 europe-docker.pkg.dev/kubemq/images/kubemq-next:latest
 ```
 
 ### 3. Run Django
