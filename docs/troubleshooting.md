@@ -17,7 +17,7 @@ Common issues and solutions for KubeMQ Celery Transport.
 docker ps | grep kubemq
 
 # Start if not running
-docker run -d -p 50000:50000 -p 9090:9090 kubemq/kubemq:latest
+docker run -d -p 50000:50000 -p 9090:9090 europe-docker.pkg.dev/kubemq/images/kubemq-next:latest
 
 # Check connectivity
 curl -s http://localhost:9090/health

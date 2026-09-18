@@ -6,7 +6,7 @@ Get a Celery app running on KubeMQ in under 5 minutes.
 
 - **Python >= 3.10**
 - **KubeMQ broker** running and accessible (default: `localhost:50000`)
-  - Docker: `docker run -d -p 50000:50000 -p 9090:9090 kubemq/kubemq:latest`
+  - Docker: `docker run -d -p 50000:50000 -p 9090:9090 europe-docker.pkg.dev/kubemq/images/kubemq-next:latest`
   - Kubernetes: see [Kubernetes Deployment Guide](kubernetes.md)
 
 ## Install
